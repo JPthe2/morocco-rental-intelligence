@@ -1,0 +1,34 @@
+{
+  "trained_at": "2026-07-25T20:02:55.218790+00:00",
+  "chosen_model": "xgboost",
+  "n_train_samples": 552,
+  "n_test_samples": 138,
+  "baseline_linear_regression": {
+    "rmse": 3314.3052310417606,
+    "mae": 2316.5546703137684,
+    "r2": 0.3302606160169834
+  },
+  "xgboost": {
+    "rmse": 2958.6187655728813,
+    "mae": 2120.188720703125,
+    "r2": 0.46629798412323
+  },
+  "residual_std": 2953.3715816775293,
+  "top_features": {
+    "num__surface_m2": 0.17908962070941925,
+    "num__bathrooms": 0.12337073683738708,
+    "cat__city_Casablanca": 0.12074285000562668,
+    "num__amenity_count": 0.05669502913951874,
+    "cat__neighborhood_Unknown": 0.055971886962652206,
+    "num__furnished_num": 0.040970027446746826,
+    "cat__city_Rabat": 0.03344215452671051,
+    "cat__city_Agadir": 0.033301033079624176,
+    "cat__city_Marrakech": 0.032662052661180496,
+    "num__bedrooms": 0.025398308411240578,
+    "cat__city_Tanger": 0.013656659983098507,
+    "cat__city_Cabo Negro": 0.012416547164320946,
+    "cat__source_site_agenz": 0.012271777726709843,
+    "cat__neighborhood_Casablanca Finance City": 0.008781601674854755,
+    "cat__city_Fès": 0.006685215979814529
+  }
+}
