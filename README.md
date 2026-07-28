@@ -2,7 +2,7 @@
 
 An AI-powered pipeline that scrapes Moroccan rental listings, cleans and centralizes them, predicts missing/hypothetical prices with a trained ML model, and exposes it all through a conversational chatbot.
 
-Built as an n8n-first system: scraping, storage, and orchestration all live in n8n (cloud). The ML price prediction service is a standalone Python/FastAPI app, deployed separately and called by the chatbot as a tool.
+Built as an n8n-first system for scraping, storage, and orchestration (n8n cloud). The chat brain, retrieval, voice, and market-intelligence features on top of that data now live in standalone local Python/FastAPI services — see [Beyond the original n8n scope](#beyond-the-original-n8n-scope) and `CHANGELOG.md` for the full phase-by-phase build history.
 
 ## Architecture
 
@@ -85,16 +85,26 @@ python train.py
 
 Once deployed, update the `predict_rent` tool's URL in the n8n chatbot workflow to the Render service's public URL + `/predict`.
 
-## Chatbot
+## Chatbot (original n8n version)
 
-n8n AI Agent (workflow: "Morocco Rental Market Chatbot") with three tools:
+n8n AI Agent (workflow: "Morocco Rental Market Chatbot") with tools querying `rental_listings` directly and calling the FastAPI `/predict` endpoint for hypothetical properties. LLM: `openai/gpt-oss-20b:free` via OpenRouter. **Superseded as the active chat brain by `agent_service/`** (see below) — the n8n workflow itself is untouched and still works standalone, but the frontend and voice interface now talk to `agent_service` instead, which adds memory, guardrails, more tools, and voice on top of the same underlying data.
 
-- `search_listings` / `get_market_stats` — Code Tool nodes that query the `rental_listings` Data Table directly (no external dependency, always available).
-- `predict_rent` — HTTP Request Tool calling the deployed FastAPI `/predict` endpoint, for hypothetical/non-listed properties.
+## Beyond the original n8n scope
 
-LLM: `openai/gpt-oss-20b:free` via OpenRouter (free tier, no cost). System prompt enforces tool-grounded answers — the model is instructed to never state a rent figure that didn't come from a tool call.
+Four standalone local services were added on top of the n8n pipeline (each has its own README with setup/run instructions):
+
+| Service | Port | Adds |
+|---|---|---|
+| `ml/price_prediction/` | 8000 | Beyond `/predict`: `GET /export` (listings for other local services), `GET /deals` (flags listings priced outside the model's own 80% confidence band), `GET /neighborhood-tiers` (KMeans clustering into Value/Mid-range/Family-oriented/Premium tiers) |
+| `rag_service/` | 8001 | Semantic search over listing descriptions (`sentence-transformers` + `chromadb`, fully local) |
+| `agent_service/` | 8002 | The actual chat brain now: a hand-rolled tool-calling agent loop (OpenRouter or Gemini) with per-session memory, code-enforced guardrails, full turn logging, voice (local Whisper STT + Piper TTS), and a one-shot natural-language-to-filter endpoint for the Listings tab |
+| `frontend/` | — | Plain HTML/JS dashboard: Overview (incl. neighborhood tiers), Listings (incl. NL filters), Predict, Deals, Chat (incl. voice) |
+
+An n8n workflow "Deal Finder" (schedule-triggered, calls `ml_service` `/deals` and upserts into a new `deal_alerts` Data Table) was also built as a portfolio artifact — left **inactive** since it needs `ml_service`'s local URL made public (ngrok or real deployment) before its schedule can actually fire; see `CHANGELOG.md` Phase 4.
+
+Full build history, verification notes, and known limitations for all of the above: `CHANGELOG.md`.
 
 ## Deliberately deferred
 
 - **Forecasting / trend analysis** — needs weeks of scraped history to mean anything; only one day of data exists so far. Revisit once the daily scraper has accumulated enough history.
-- **RAG, anomaly detection, recommendation engine** — listed as future extensions in the original project scope; not built.
+- **Multi-agent orchestration, weekly auto-generated reports** — considered for Phase 4, not built; see `CHANGELOG.md` Phase 4 for what was prioritized instead and why.
