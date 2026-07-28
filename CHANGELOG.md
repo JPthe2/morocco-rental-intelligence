@@ -282,3 +282,80 @@ works, no code changes needed.
 - Clustering re-runs from scratch on every `/neighborhood-tiers` call
   (KMeans with `random_state=42` for reproducibility, but no caching) —
   fine for ~60 neighborhoods, would need caching at a much larger scale.
+
+## Phase 4 (continued) — Multi-agent orchestration
+
+The last of the five original Phase 4 options, picked up after a pause.
+Restructured the single Concierge agent into an orchestrator/workers
+pattern: one supervisor agent, two specialist sub-agents exposed to it as
+callable tools — not a framework, the same manual loop from `agent.py`
+reused at a smaller scope per sub-agent.
+
+- **`llm_client.py`** (new) — the OpenAI-compatible chat-completions client
+  extracted out of `agent.py` so both Concierge and the sub-agents can share
+  it without a circular import (`agent.py` → `subagents.py` →  needs the LLM
+  client → would need `agent.py` back, if it had stayed there).
+  `agent._call_llm` / `agent.DegradedResponseError` are kept as aliases so
+  existing code and tests didn't need to change.
+- **`subagents.py`** (new) — **Scout** (finds/monitors listings:
+  `search_listings`, `rag_search`, `live_web_lookup`, and a new
+  `list_recent_deals` wrapping Phase 4's `/deals`) and **Analyst** (market
+  stats/predictions/trends: `get_market_stats`, `predict_rent`,
+  `explain_prediction`, and a new `get_neighborhood_tiers` wrapping Phase
+  4's `/neighborhood-tiers`). Each runs its own bounded tool loop
+  (`SUB_AGENT_MAX_TOOL_CALLS = 3`, separate from Concierge's own budget) over
+  only its own tools — Scout can't call `predict_rent`, Analyst can't call
+  `live_web_lookup`.
+- **Concierge** (`agent.py`, rewritten) — now holds only 3 tools:
+  `remember_preference`, `ask_scout`, `ask_analyst`. No longer touches
+  `search_listings`/`predict_rent`/etc. directly; it delegates and
+  synthesizes. System prompt rewritten accordingly.
+- **Observability carries through the delegation tree**: each sub-agent
+  accepts the Concierge's `observability.TurnLogger` and logs its own tool
+  calls into the *same* turn record, name-prefixed (`scout:search_listings`,
+  `analyst:get_market_stats`) — one turn's log shows the whole tree, not
+  just the top-level `ask_scout`/`ask_analyst` calls.
+- **Live-lookup guardrail still holds across the delegation boundary**: if
+  Scout uses `live_web_lookup`, that fact propagates back up through
+  `ask_scout`'s return value so Concierge's final-answer disclosure check
+  (`guardrails.ensure_live_lookup_disclosed`) still fires — this was the
+  trickiest part of the refactor to get right (a flag needs to survive
+  crossing from the sub-agent's local scope into the Concierge's turn-level
+  state), so it's verified with a dedicated test at the `agent.run_turn`
+  level, not just inside the sub-agent itself.
+- `POST /agents/scout` / `POST /agents/analyst` (new, `main.py`) — talk to
+  either specialist directly, bypassing Concierge/memory. Useful for
+  debugging and for demoing each specialist in isolation.
+- 10 new pytest cases: `tests/test_subagents.py` (6 — tool-schema scoping is
+  disjoint between Scout/Analyst, tool dispatch → final answer, live-lookup
+  flag propagation, per-sub-agent budget enforcement (the 4th of 4
+  consecutive tool-call attempts is budget-blocked and never actually
+  executes), degraded-LLM handling, the two new tool functions) and
+  `tests/test_agent_orchestration.py` (4 — Concierge-level live-lookup
+  propagation with and without the flag set, `remember_preference`
+  dispatch still works post-rewrite, Concierge's tool schemas are exactly
+  the 3 delegation-only tools). 43/43 tests passing service-wide
+  (`test_agent_filters.py` needed zero changes, confirming the `_call_llm`
+  alias worked).
+
+**Verified live**: `/agents/scout` and `/agents/analyst` each answered
+correctly in isolation using only their scoped tools. Then a full `/chat`
+turn ("I want a 2-bedroom in Rabat under 6000 MAD, remember that. Also,
+what's a good area price-wise?") correctly triggered `remember_preference`
+×3, `ask_analyst` (which internally called `get_market_stats` twice and
+attempted `get_neighborhood_tiers`), and `ask_scout` (which internally
+called `search_listings`) — synthesized into one coherent answer citing
+both the specific listing Scout found and the market averages Analyst
+computed. The observability log confirmed the full nested tree was
+captured correctly, including a graceful in-place recovery when
+`get_neighborhood_tiers` hit the still-stale `ml_service` process's 404
+(the pre-existing, unrelated restart-needed issue) — Analyst just
+proceeded without that data instead of failing the turn.
+
+**Known limitations**: see the new "Known limitations" additions in
+`agent_service/README.md` — orchestration costs real latency/tokens (3+ LLM
+round trips minimum for any query touching both specialists, vs. 1 for the
+single-agent version), and sub-agents can't share context with each other
+mid-delegation (each `ask_scout`/`ask_analyst` call is independent; Concierge
+concatenates their answers, but Scout and Analyst can't inform each other's
+reasoning within one delegation).

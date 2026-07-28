@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 import agent
 import config
 import memory
+import subagents
 import voice
 
 app = FastAPI(title="Morocco Rental Agent Service", version="1.0")
@@ -59,6 +60,26 @@ def nl_filter(req: NLFilterRequest):
     the frontend's Listings tab already supports (city / max_price / min_bedrooms).
     A single one-shot LLM call, not the full agent loop — no memory, no tools."""
     return agent.extract_filters(req.query)
+
+
+# ---------------------------------------------------------------------------
+# Multi-agent orchestration: direct access to the specialist sub-agents, for
+# debugging/demoing each one in isolation from the Concierge (agent.run_turn
+# already delegates to these internally on every /chat and /voice/turn call).
+# ---------------------------------------------------------------------------
+
+class SubAgentRequest(BaseModel):
+    question: str = Field(..., examples=["What's the average rent for a 2-bedroom in Rabat?"])
+
+
+@app.post("/agents/scout")
+def agents_scout(req: SubAgentRequest):
+    return subagents.run_scout(req.question)
+
+
+@app.post("/agents/analyst")
+def agents_analyst(req: SubAgentRequest):
+    return subagents.run_analyst(req.question)
 
 
 # ---------------------------------------------------------------------------

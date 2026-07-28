@@ -1,93 +1,69 @@
-"""The agent loop: a manual (non-framework) tool-calling loop against OpenRouter.
-
-Deliberately hand-rolled rather than built on LangGraph or similar — call the
-model, execute any tool calls it asks for, feed results back, repeat until it
-gives a final answer or the per-turn tool-call budget is exhausted.
+"""Concierge: the agent the user actually talks to. Deliberately holds almost
+no tools itself — it delegates to two specialist sub-agents (subagents.py:
+Scout for finding/monitoring listings, Analyst for stats/predictions/trends)
+and synthesizes their answers. A plain orchestrator/workers pattern: one
+supervisor agent, two specialists exposed to it as callable tools, each
+running the same kind of manual tool-calling loop at a smaller scope — no
+framework, still explainable end to end.
 """
 import json
 
-import requests
-
-import config
 import guardrails
+import llm_client
 import memory
 import observability
+import subagents
 import tools
 
-SYSTEM_PROMPT = """You are a rental market assistant for Morocco, backed by real listings scraped from agenz.ma and avito.ma. You have tools to search stored listings, compute market stats, predict rent for hypothetical properties (with an explanation of price drivers), semantically search listing descriptions for fuzzy requests, and — as a last resort — fetch live listings directly from the web.
+# Re-exported so existing callers/tests (`agent._call_llm`, `agent.DegradedResponseError`)
+# keep working — llm_client.py is the actual implementation, shared with subagents.py.
+_call_llm = llm_client.call_llm
+DegradedResponseError = llm_client.DegradedResponseError
+
+SYSTEM_PROMPT = """You are Concierge, the conversational front door for a Morocco rental market intelligence system. You don't search listings or compute statistics yourself — you delegate to two specialist sub-agents and synthesize their answers for the user:
+- ask_scout: for finding/monitoring listings — structured search, semantic/fuzzy search (e.g. "quiet", "near a school"), live web lookups for areas not in the stored dataset, and recently flagged underpriced deals.
+- ask_analyst: for market statistics, ML rent predictions (with explanations of price drivers), and neighborhood market-tier analysis.
 
 Rules:
-- Always use a tool to ground any numeric answer (rent averages, comparable listings, price predictions). Never state a rent figure that did not come from a tool result.
-- Prefer search_listings / get_market_stats first. Use rag_search for fuzzy, qualitative requests structured filters can't express (e.g. "quiet", "near a school"). Use predict_rent / explain_prediction only for hypothetical properties not in the dataset. Only use live_web_lookup if the stored dataset returned zero matches for the city/area asked about.
+- Always delegate to Scout or Analyst before answering any numeric question (rent averages, listings, price predictions) — never state a rent figure that didn't come from a sub-agent's answer.
 - If the user states a lasting preference (budget, minimum bedrooms, preferred city, etc.), call remember_preference so it isn't lost between turns.
-- Live web lookups are an unverified snapshot — always say so when you use one.
-- Keep answers concise and mention how many listings a statistic is based on."""
+- If a sub-agent's answer mentions a live/unverified lookup, relay that caveat to the user — don't drop it.
+- Keep answers concise and mention how many listings a statistic is based on when the sub-agent provides that."""
 
+ASK_SCOUT_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "ask_scout",
+        "description": "Delegate to Scout, a specialist sub-agent for finding/monitoring rental listings (structured search, semantic search, live web lookups, recently flagged deals). Ask it one specific question.",
+        "parameters": {
+            "type": "object",
+            "properties": {"question": {"type": "string", "description": "The specific question to ask Scout"}},
+            "required": ["question"],
+        },
+    },
+}
 
-class DegradedResponseError(Exception):
-    """Raised when the LLM backend can't be used (missing key, quota exhausted,
-    network error). Caught by run_turn to return an honest message instead of
-    a crash."""
+ASK_ANALYST_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "ask_analyst",
+        "description": "Delegate to Analyst, a specialist sub-agent for market statistics, ML price predictions with explanations, and neighborhood tier analysis. Ask it one specific question.",
+        "parameters": {
+            "type": "object",
+            "properties": {"question": {"type": "string", "description": "The specific question to ask Analyst"}},
+            "required": ["question"],
+        },
+    },
+}
 
-
-def _call_llm(messages: list[dict], tool_schemas: list[dict] | None = None, tool_choice="auto") -> dict:
-    if not config.LLM_API_KEY:
-        raise DegradedResponseError(
-            f"No API key is configured for LLM_PROVIDER={config.LLM_PROVIDER}. "
-            "Set it in agent_service/.env to enable chat."
-        )
-    try:
-        resp = requests.post(
-            f"{config.LLM_BASE_URL}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {config.LLM_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": config.LLM_MODEL,
-                "messages": messages,
-                "tools": tool_schemas if tool_schemas is not None else tools.TOOL_SCHEMAS,
-                "tool_choice": tool_choice,
-            },
-            timeout=60,
-        )
-    except requests.RequestException as exc:
-        raise DegradedResponseError(f"Could not reach {config.LLM_PROVIDER}: {exc}") from exc
-
-    if resp.status_code == 429:
-        raise DegradedResponseError(
-            f"{config.LLM_PROVIDER}'s free-tier quota looks exhausted right now (HTTP 429). "
-            "Try again shortly, or switch LLM_PROVIDER / add credits in agent_service/.env."
-        )
-    if resp.status_code == 402:
-        raise DegradedResponseError(f"{config.LLM_PROVIDER} reports insufficient credits for this model (HTTP 402).")
-    if not resp.ok:
-        raise DegradedResponseError(f"{config.LLM_PROVIDER} request failed: HTTP {resp.status_code} — {resp.text[:300]}")
-
-    return resp.json()
-
-
-def _dispatch_tool_call(name: str, args: dict, session_id: str) -> dict:
-    if name == "remember_preference":
-        key, value = args.get("key"), args.get("value")
-        if key:
-            memory.update_preferences(session_id, {key: value})
-        return tools.remember_preference(args)
-
-    fn = tools.TOOL_FUNCTIONS.get(name)
-    if fn is None:
-        return {"error": f"Unknown tool '{name}'."}
-    try:
-        return fn(args)
-    except requests.RequestException as exc:
-        return {"error": f"Tool '{name}' failed to reach its backing service: {exc}"}
-    except Exception as exc:  # noqa: BLE001 - tool failures must degrade, not crash the turn
-        return {"error": f"Tool '{name}' raised an unexpected error: {exc}"}
+_REMEMBER_PREFERENCE_SCHEMA = next(s for s in tools.TOOL_SCHEMAS if s["function"]["name"] == "remember_preference")
+CONCIERGE_TOOL_SCHEMAS = [_REMEMBER_PREFERENCE_SCHEMA, ASK_SCOUT_SCHEMA, ASK_ANALYST_SCHEMA]
 
 
 def run_turn(session_id: str, user_message: str) -> dict:
-    """Run one full agent turn (possibly several tool round-trips).
-    Returns {"response_text": str, "degraded": bool}."""
+    """Run one full Concierge turn (possibly several delegations to Scout/Analyst,
+    each of which may itself make several tool calls). Returns
+    {"response_text": str, "degraded": bool}."""
     memory.touch_session(session_id)
     memory.append_message(session_id, "user", user_message)
 
@@ -105,7 +81,7 @@ def run_turn(session_id: str, user_message: str) -> dict:
 
     try:
         while True:
-            completion = _call_llm(messages)
+            completion = _call_llm(messages, tool_schemas=CONCIERGE_TOOL_SCHEMAS)
             usage = completion.get("usage", {})
             logger.add_usage(usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
 
@@ -125,7 +101,7 @@ def run_turn(session_id: str, user_message: str) -> dict:
             if budget.exhausted:
                 messages.append({
                     "role": "system",
-                    "content": "You have used the maximum number of tool calls for this turn. "
+                    "content": "You have used the maximum number of delegations for this turn. "
                                "Give your best final answer now using what you already have, "
                                "and say clearly if something couldn't be verified.",
                 })
@@ -137,15 +113,28 @@ def run_turn(session_id: str, user_message: str) -> dict:
                 except json.JSONDecodeError:
                     fn_args = {}
 
-                if fn_name == "live_web_lookup":
-                    used_live_lookup = True
-
                 if not budget.try_consume():
-                    result = {"error": "Tool call budget exhausted for this turn."}
-                else:
+                    result = {"error": "Delegation budget exhausted for this turn."}
+                elif fn_name == "remember_preference":
                     with logger.record_tool_call(fn_name, fn_args) as record:
-                        result = _dispatch_tool_call(fn_name, fn_args, session_id)
+                        key, value = fn_args.get("key"), fn_args.get("value")
+                        if key:
+                            memory.update_preferences(session_id, {key: value})
+                        result = tools.remember_preference(fn_args)
                         record["result_summary"] = str(result)[:300]
+                elif fn_name == "ask_scout":
+                    with logger.record_tool_call(fn_name, fn_args) as record:
+                        sub_result = subagents.run_scout(fn_args.get("question", ""), parent_logger=logger)
+                        used_live_lookup = used_live_lookup or sub_result.get("used_live_lookup", False)
+                        result = {"answer": sub_result["answer"]}
+                        record["result_summary"] = str(result)[:300]
+                elif fn_name == "ask_analyst":
+                    with logger.record_tool_call(fn_name, fn_args) as record:
+                        sub_result = subagents.run_analyst(fn_args.get("question", ""), parent_logger=logger)
+                        result = {"answer": sub_result["answer"]}
+                        record["result_summary"] = str(result)[:300]
+                else:
+                    result = {"error": f"Unknown tool '{fn_name}'."}
 
                 messages.append({
                     "role": "tool",

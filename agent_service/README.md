@@ -1,41 +1,66 @@
 # agent_service
 
 The chatbot's new brain: a standalone FastAPI service (`127.0.0.1:8002`) with a
-hand-rolled tool-calling agent loop, replacing n8n's built-in AI Agent node for
-the parts that needed things it doesn't support well — persistent memory,
-code-enforced guardrails, and voice. The n8n scraping/storage workflows are
-untouched; this only replaces the chat brain. The frontend's Chat and Voice
-tabs both call this service directly (`http://127.0.0.1:8002`).
+hand-rolled multi-agent orchestration, replacing n8n's built-in AI Agent node
+for the parts that needed things it doesn't support well — persistent memory,
+code-enforced guardrails, voice, and now specialist delegation. The n8n
+scraping/storage workflows are untouched; this only replaces the chat brain.
+The frontend's Chat tab (incl. voice) calls this service directly
+(`http://127.0.0.1:8002`).
 
 ## Why a manual loop instead of a framework
 
-A framework (LangGraph, etc.) buys abstraction we don't need at this scale. A
-plain `while` loop — call the model, run any tool calls it asks for, feed
-results back, repeat — is ~150 lines, has no hidden control flow, and is
-easier to reason about and explain than a framework's internals. See `agent.py`.
+A framework (LangGraph, CrewAI, etc.) buys abstraction we don't need at this
+scale. A plain `while` loop — call the model, run any tool calls it asks for,
+feed results back, repeat — has no hidden control flow, and is easier to
+reason about and explain than a framework's internals. The multi-agent
+version below is the *same* loop reused at a smaller scope for each
+sub-agent, not a new abstraction. See `agent.py` / `subagents.py`.
 
-## Architecture
+## Architecture: orchestrator + specialist sub-agents
+
+**Concierge** (`agent.py`) is the only agent the user talks to. It holds
+almost no tools itself — just `remember_preference` plus two delegation
+tools, `ask_scout` and `ask_analyst` — and synthesizes their answers. Each
+sub-agent (`subagents.py`) runs its own small, bounded tool-calling loop over
+a *restricted* toolset:
+
+- **Scout** — finds/monitors listings: `search_listings`, `rag_search`,
+  `live_web_lookup`, `list_recent_deals`.
+- **Analyst** — market statistics and predictions: `get_market_stats`,
+  `predict_rent`, `explain_prediction`, `get_neighborhood_tiers`.
 
 ```
-frontend / n8n webhook
-        |
-        v
-   POST /chat  (main.py)
-        |
-        v
-  agent.run_turn()  (agent.py)
-        |  loop: call OpenRouter -> execute requested tool calls -> feed back
-        v
-     tools.py  ---->  ml_service  (127.0.0.1:8000)   /predict, /export
-                  ---->  rag_service (127.0.0.1:8001)  /rag/search
-                  ---->  avito.ma / agenz.ma            (live_web_lookup only)
-        |
-        v
-  memory.py (sessions.db)      guardrails.py           observability.py
-  conversation history +       price sanity checks,     every turn logged
-  extracted preferences        tool-call budget,         to logs/turns.db
-                                live-lookup labeling
+frontend
+   |
+   v
+POST /chat  (main.py)
+   |
+   v
+Concierge: agent.run_turn()  (agent.py)
+   |  tools: remember_preference, ask_scout, ask_analyst
+   |
+   +--ask_scout-->  Scout: subagents.run_scout()  --tools-->  search_listings, rag_search,
+   |                                                            live_web_lookup, list_recent_deals
+   |
+   +--ask_analyst-> Analyst: subagents.run_analyst() --tools-> get_market_stats, predict_rent,
+   |                                                            explain_prediction, get_neighborhood_tiers
+   v
+llm_client.py  ---->  OpenRouter or Gemini (config.LLM_PROVIDER), shared by Concierge + both sub-agents
+tools.py       ---->  ml_service  (127.0.0.1:8000)   /predict, /export, /deals, /neighborhood-tiers
+               ---->  rag_service (127.0.0.1:8001)  /rag/search
+               ---->  avito.ma / agenz.ma            (live_web_lookup only)
+   |
+   v
+memory.py (sessions.db)      guardrails.py           observability.py
+conversation history +       price sanity checks,     every turn logged, incl. each
+extracted preferences        tool-call budget,         sub-agent's own tool calls
+(Concierge-level only)       live-lookup labeling      (name-prefixed "scout:"/"analyst:")
 ```
+
+`POST /agents/scout` and `POST /agents/analyst` let you talk to either
+specialist directly, bypassing the Concierge — useful for debugging or
+demoing each one in isolation (`/chat` already delegates to both internally).
 
 ## Setup
 
@@ -60,11 +85,15 @@ running first — the agent's tools call them directly.
 
 ## Endpoints
 
-- `GET /health` — whether an OpenRouter key is configured, and which model.
+- `GET /health` — which LLM provider/model is configured, and whether a key is set.
 - `POST /chat` — `{"session_id": "demo-1", "message": "..."}` → `{"response_text": "...", "degraded": false}`.
-  `degraded: true` means the LLM backend couldn't be reached (missing key,
-  OpenRouter free-tier quota exhausted, etc.) — `response_text` explains why,
-  in plain language, instead of the request failing with a 500.
+  Runs the full Concierge → Scout/Analyst orchestration. `degraded: true` means
+  the LLM backend couldn't be reached (missing key, free-tier quota exhausted,
+  etc.) — `response_text` explains why, in plain language, instead of the
+  request failing with a 500.
+- `POST /agents/scout` / `POST /agents/analyst` — `{"question": "..."}` →
+  `{"answer": "...", "used_live_lookup": bool, "degraded": bool}`. Talks to one
+  specialist directly, bypassing the Concierge and memory.
 
 ### Example: multi-turn conversation with memory
 
@@ -108,17 +137,20 @@ curl -X POST http://127.0.0.1:8002/voice/turn \
   -F "file=@question.wav"
 ```
 
-## Tools available to the agent
+## Tools, by agent
 
-| Tool | Backing | Notes |
-|---|---|---|
-| `search_listings` | `ml_service` `/export` | mirrors the n8n Code Tool node of the same name |
-| `get_market_stats` | `ml_service` `/export` | ditto |
-| `predict_rent` | `ml_service` `/predict` | guardrail-checked against a plausible per-city range before being returned |
-| `explain_prediction` | `ml_service` `/predict` | turns SHAP `top_drivers` into a plain-language sentence |
-| `rag_search` | `rag_service` `/rag/search` | Phase 1's semantic search |
-| `live_web_lookup` | avito.ma / agenz.ma directly | Python port of n8n's "Live Market Lookup" sub-workflow's regex extraction; always labeled unverified |
-| `remember_preference` | local | writes into the session's stored preferences, not an external call |
+| Agent | Tool | Backing | Notes |
+|---|---|---|---|
+| Concierge | `remember_preference` | local | writes into the session's stored preferences, not an external call |
+| Concierge | `ask_scout` / `ask_analyst` | delegates to `subagents.py` | the only other tools Concierge has — it doesn't touch listing/stats tools directly |
+| Scout | `search_listings` | `ml_service` `/export` | mirrors the n8n Code Tool node of the same name |
+| Scout | `rag_search` | `rag_service` `/rag/search` | Phase 1's semantic search |
+| Scout | `live_web_lookup` | avito.ma / agenz.ma directly | Python port of n8n's "Live Market Lookup" sub-workflow's regex extraction; always labeled unverified |
+| Scout | `list_recent_deals` | `ml_service` `/deals` | Phase 4's deal-finder logic, exposed to Scout ("monitors listings") |
+| Analyst | `get_market_stats` | `ml_service` `/export` | |
+| Analyst | `predict_rent` | `ml_service` `/predict` | guardrail-checked against a plausible per-city range before being returned |
+| Analyst | `explain_prediction` | `ml_service` `/predict` | turns SHAP `top_drivers` into a plain-language sentence |
+| Analyst | `get_neighborhood_tiers` | `ml_service` `/neighborhood-tiers` | Phase 4's KMeans clustering, exposed to Analyst ("interprets trends") |
 
 ## Guardrails (enforced in code, not just prompted)
 
@@ -126,9 +158,12 @@ curl -X POST http://127.0.0.1:8002/voice/turn \
   per city from the local listings snapshot (median × [0.15, 6], falling back
   to a generous global range for cities with too little local data) and
   rejects predictions outside it rather than returning them as fact.
-- **Tool-call budget**: `guardrails.ToolCallBudget` caps tool calls per turn
-  (`MAX_TOOL_CALLS_PER_TURN`, default 5) — if the model tries to keep calling
-  tools past that, it's told to give its best final answer instead.
+- **Tool-call budget, at both levels**: Concierge is capped by
+  `guardrails.ToolCallBudget` (`MAX_TOOL_CALLS_PER_TURN`, default 5 — counts
+  delegations, i.e. `ask_scout`/`ask_analyst` calls, plus `remember_preference`).
+  Each sub-agent has its *own* separate, smaller budget
+  (`subagents.SUB_AGENT_MAX_TOOL_CALLS`, default 3) for its internal tool
+  calls — a runaway Scout can't consume Concierge's budget or vice versa.
 - **Live-lookup labeling**: `live_web_lookup` results are stamped
   `unverified: true` with a disclaimer at the code level
   (`guardrails.label_live_lookup_result`), and if the model's final answer
@@ -149,10 +184,13 @@ curl -X POST http://127.0.0.1:8002/voice/turn \
 ## Observability
 
 Every turn is logged to `logs/turns.db`: the user message, every tool call
-made (name, arguments, latency, a truncated result summary), total turn
-latency, prompt/completion token counts (from OpenRouter's `usage` field), and
-whether the turn succeeded. This is meant as the foundation for a future eval
-harness, not a harness itself.
+made — including each sub-agent's *own* internal tool calls, name-prefixed
+(`scout:search_listings`, `analyst:get_market_stats`, etc.) so one turn's log
+shows the full delegation tree, not just the Concierge's top-level
+`ask_scout`/`ask_analyst` calls — plus latency, a truncated result summary,
+total turn latency, prompt/completion token counts, and whether the turn
+succeeded. This is meant as the foundation for a future eval harness, not a
+harness itself.
 
 ## Tests
 
@@ -161,10 +199,13 @@ cd agent_service
 ./.venv/Scripts/pytest
 ```
 
-Covers guardrails (price bounds, tool-call budget, live-lookup labeling),
-memory (session lifecycle, preference merging, expiry), and the pure tool
-logic (`search_listings`/`get_market_stats` filtering, prediction rejection,
-SHAP humanization) with the network calls monkeypatched out.
+39 tests: guardrails (price bounds, tool-call budget, live-lookup labeling),
+memory (session lifecycle, preference merging, expiry), pure tool logic
+(`search_listings`/`get_market_stats` filtering, prediction rejection, SHAP
+humanization), voice (WAV encoding, markdown-for-speech stripping), NL filter
+extraction, and sub-agent orchestration (tool-schema scoping, dispatch,
+per-sub-agent budget enforcement, live-lookup flag propagation, degraded
+handling) — all with network/LLM calls monkeypatched out.
 
 ## Known limitations / tradeoffs
 
@@ -188,3 +229,17 @@ SHAP humanization) with the network calls monkeypatched out.
   model is instructed to call `remember_preference` when the user states
   something worth remembering. Simple and explainable, but only as reliable
   as the model's judgment about what counts as "lasting."
+- **Orchestration costs latency and tokens.** A question needing both Scout
+  and Analyst now means 3 separate LLM round trips minimum (Concierge decides
+  to delegate, each sub-agent reasons independently) instead of 1 — noticeably
+  slower than the single-agent version, and burns free-tier quota faster.
+  Worth it here for the clean separation of concerns and the interview
+  talking point; wouldn't be the right tradeoff for a latency-sensitive
+  product.
+- **Sub-agents can't talk to each other or ask Concierge for clarification**
+  — each `ask_scout`/`ask_analyst` call is a one-shot, independent
+  delegation with no shared context between them. If a question genuinely
+  needs Scout's and Analyst's outputs to inform each other (not just be
+  concatenated by Concierge), this pattern doesn't support that — a real
+  limitation of the simple orchestrator/workers shape, not just an
+  unfinished corner.
