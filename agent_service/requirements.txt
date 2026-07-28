@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+requests
+python-dotenv
+pydantic
+pytest
+python-multipart
+faster-whisper
+piper-tts

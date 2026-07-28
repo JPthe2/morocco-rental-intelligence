@@ -1,0 +1,9 @@
+.venv/
+.env
+sessions.db
+logs/
+__pycache__/
+*.pyc
+.pytest_cache/
+voice_models/
+voice_output/
