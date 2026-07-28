@@ -9,13 +9,22 @@ import numpy as np
 import pandas as pd
 import shap
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
 
 BASE_DIR = Path(__file__).parent.parent
 MODEL_PATH = BASE_DIR / "models" / "latest.pkl"
 METRICS_PATH = BASE_DIR / "models" / "latest_metrics.json"
 
 app = FastAPI(title="Morocco Rental Price Prediction API", version="1.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 _artifact = None
 _metrics = None
@@ -75,6 +84,19 @@ def model_info():
     return _metrics
 
 
+SNAPSHOT_PATH = BASE_DIR / "data" / "listings_snapshot.json"
+
+
+@app.get("/export")
+def export_listings():
+    """Read-only export of the current listings snapshot, for downstream local
+    services (e.g. rag_service) that need listing data without talking to n8n directly."""
+    if not SNAPSHOT_PATH.exists():
+        raise HTTPException(status_code=404, detail="No listings snapshot found.")
+    with open(SNAPSHOT_PATH, encoding="utf-8") as f:
+        return json.load(f)
+
+
 @app.post("/predict", response_model=PredictResponse)
 def predict(req: PredictRequest):
     artifact = get_artifact()
@@ -127,6 +149,154 @@ def predict(req: PredictRequest):
         top_drivers=top_drivers,
         warning=warning,
     )
+
+
+MIN_PLAUSIBLE_RENT_MAD = 1000  # below this is almost always bad scraped data (deposit, daily rate, typo), not a real deal
+
+
+@app.get("/deals")
+def deals(threshold_pct: float = 15.0, limit: int = 50, min_actual_price: float = MIN_PLAUSIBLE_RENT_MAD):
+    """Compare each listing's actual price against the model's predicted price
+    for a comparable property; flag listings priced >= threshold_pct% below the
+    prediction as potential deals. Batches every listing through the pipeline in
+    one call rather than one HTTP round trip per listing.
+
+    Listings priced below min_actual_price are excluded up front — a handful of
+    scraped listings have implausibly low prices (250-400 MAD/month) that are
+    clearly data errors (daily rate or deposit picked up instead of monthly
+    rent), not genuine deals, and would otherwise dominate the results."""
+    artifact = get_artifact()
+    pipeline = artifact["pipeline"]
+    if not SNAPSHOT_PATH.exists():
+        raise HTTPException(status_code=404, detail="No listings snapshot found.")
+    with open(SNAPSHOT_PATH, encoding="utf-8") as f:
+        listings = json.load(f)
+
+    priced = [
+        l for l in listings
+        if isinstance(l.get("rent_price"), (int, float)) and l["rent_price"] >= min_actual_price
+    ]
+    if not priced:
+        return {"count": 0, "threshold_pct": threshold_pct, "deals": []}
+
+    rows = [{
+        "city": l.get("city"),
+        "neighborhood": l.get("neighborhood") or "Unknown",
+        "property_type": l.get("property_type") or "appartement",
+        "source_site": l.get("source_site") or "agenz",
+        "surface_m2": l.get("surface_m2"),
+        "bedrooms": l.get("bedrooms"),
+        "bathrooms": l.get("bathrooms"),
+        "amenity_count": len(l["amenities"].split(",")) if l.get("amenities") else 0,
+        "furnished_num": (1 if l.get("furnished") else 0) if l.get("furnished") is not None else None,
+    } for l in priced]
+
+    X = pd.DataFrame(rows)[artifact["feature_columns"]]
+    predicted = np.expm1(pipeline.predict(X))
+    residual_std = artifact["residual_std"]
+
+    threshold = threshold_pct / 100.0
+    flagged = []
+    for listing, pred in zip(priced, predicted):
+        if pred <= 0:
+            continue
+        actual = listing["rent_price"]
+        discount = (pred - actual) / pred
+        # Same 80% band /predict already shows as confidence_interval_80pct: require the
+        # actual price to fall genuinely outside the model's own uncertainty band, not just
+        # below the point estimate — a flat % threshold alone flags far too much noise given
+        # this model's modest R² (~0.47, see ml/price_prediction/README).
+        low_bound_80pct = max(0.0, pred - 1.28 * residual_std)
+        if discount >= threshold and actual < low_bound_80pct:
+            flagged.append({
+                "source_site": listing.get("source_site"),
+                "city": listing.get("city"),
+                "neighborhood": listing.get("neighborhood"),
+                "rent_price": actual,
+                "predicted_rent_mad": round(float(pred), -1),
+                "confidence_low_bound_mad": round(float(low_bound_80pct), -1),
+                "discount_pct": round(discount * 100, 1),
+                "surface_m2": listing.get("surface_m2"),
+                "bedrooms": listing.get("bedrooms"),
+                "bathrooms": listing.get("bathrooms"),
+                "url": listing.get("source_url"),
+            })
+
+    flagged.sort(key=lambda d: d["discount_pct"], reverse=True)
+    return {"count": len(flagged), "threshold_pct": threshold_pct, "deals": flagged[:limit]}
+
+
+def _label_tiers(cluster_stats: pd.DataFrame) -> dict:
+    """Label clusters by centroid characteristics: highest price/m² -> Premium,
+    lowest -> Value. Among any remaining middle clusters, the one with the most
+    average bedrooms -> Family-oriented, the rest -> Mid-range."""
+    by_price = cluster_stats.sort_values("avg_price_per_m2")
+    ids = by_price["cluster"].tolist()
+    tier: dict = {}
+    if len(ids) == 1:
+        tier[ids[0]] = "Balanced"
+        return tier
+    tier[ids[0]] = "Value"
+    tier[ids[-1]] = "Premium"
+    middle_ids = ids[1:-1]
+    if middle_ids:
+        middle = cluster_stats[cluster_stats["cluster"].isin(middle_ids)]
+        family_id = middle.sort_values("avg_bedrooms", ascending=False)["cluster"].iloc[0]
+        for cid in middle_ids:
+            tier[cid] = "Family-oriented" if cid == family_id else "Mid-range"
+    return tier
+
+
+@app.get("/neighborhood-tiers")
+def neighborhood_tiers(n_clusters: int = 4, min_listings: int = 3):
+    """Cluster neighborhoods into market tiers via KMeans on median price/m²,
+    average bedroom count, and average amenity count. Tiers are labeled from
+    cluster centroid characteristics, not arbitrary cluster indices."""
+    if not SNAPSHOT_PATH.exists():
+        raise HTTPException(status_code=404, detail="No listings snapshot found.")
+    with open(SNAPSHOT_PATH, encoding="utf-8") as f:
+        listings = json.load(f)
+
+    df = pd.DataFrame(listings)
+    df = df[df["rent_price"].notna() & df["city"].notna()].copy()
+    df["neighborhood"] = df["neighborhood"].fillna("Unknown")
+    df["surface_m2"] = pd.to_numeric(df["surface_m2"], errors="coerce")
+    df["price_per_m2"] = df["rent_price"] / df["surface_m2"]
+    df["amenity_count"] = df["amenities"].apply(lambda a: len(a.split(",")) if isinstance(a, str) and a else 0)
+
+    grouped = df.groupby(["city", "neighborhood"]).agg(
+        listing_count=("rent_price", "count"),
+        median_price_per_m2=("price_per_m2", "median"),
+        avg_bedrooms=("bedrooms", "mean"),
+        avg_amenity_count=("amenity_count", "mean"),
+    ).reset_index()
+    grouped = grouped[grouped["listing_count"] >= min_listings].dropna(subset=["median_price_per_m2"])
+
+    if len(grouped) < n_clusters:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Not enough neighborhoods with >= {min_listings} listings to form {n_clusters} clusters (have {len(grouped)}).",
+        )
+
+    features = grouped[["median_price_per_m2", "avg_bedrooms", "avg_amenity_count"]].fillna(0)
+    X_scaled = StandardScaler().fit_transform(features)
+    km = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+    grouped["cluster"] = km.fit_predict(X_scaled)
+
+    cluster_stats = grouped.groupby("cluster").agg(
+        avg_price_per_m2=("median_price_per_m2", "mean"),
+        avg_bedrooms=("avg_bedrooms", "mean"),
+    ).reset_index()
+    cluster_to_tier = _label_tiers(cluster_stats)
+    grouped["tier"] = grouped["cluster"].map(cluster_to_tier)
+    grouped = grouped.sort_values("median_price_per_m2", ascending=False)
+
+    result = grouped[[
+        "city", "neighborhood", "tier", "listing_count",
+        "median_price_per_m2", "avg_bedrooms", "avg_amenity_count",
+    ]].round({"median_price_per_m2": 1, "avg_bedrooms": 1, "avg_amenity_count": 1}).to_dict(orient="records")
+
+    return {"n_clusters": n_clusters, "neighborhoods": result}
 
 
 def _known_cities() -> set:
