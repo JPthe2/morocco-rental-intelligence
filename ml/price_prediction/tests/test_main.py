@@ -71,6 +71,18 @@ def test_neighborhood_tiers_groups_by_city_and_neighborhood(tmp_path, monkeypatc
     assert tier_by_name["TestZoneB"] != tier_by_name["TestZoneA"]
 
 
+def test_neighborhood_tiers_response_is_json_serializable(tmp_path, monkeypatch):
+    snapshot_path = tmp_path / "snapshot.json"
+    snapshot_path.write_text(json.dumps(_sample_listings()), encoding="utf-8")
+    monkeypatch.setattr(api_main, "SNAPSHOT_PATH", snapshot_path)
+
+    result = api_main.neighborhood_tiers(n_clusters=2, min_listings=2)
+    json.dumps(result)  # pandas aggregations can leak numpy int64/float64 the same way /deals did
+    for n in result["neighborhoods"]:
+        assert type(n["listing_count"]) is int
+        assert type(n["median_price_per_m2"]) is float
+
+
 def test_neighborhood_tiers_rejects_too_few_neighborhoods_for_cluster_count(tmp_path, monkeypatch):
     snapshot_path = tmp_path / "snapshot.json"
     snapshot_path.write_text(json.dumps(_sample_listings()[:3]), encoding="utf-8")  # only 1 neighborhood
@@ -99,6 +111,29 @@ def test_deals_flags_a_listing_priced_far_below_comparable_ones(tmp_path, monkey
     result = api_main.deals(threshold_pct=15.0, min_actual_price=500)
     flagged_urls = {d["url"] for d in result["deals"]}
     assert "https://x/cheap" in flagged_urls
+
+
+def test_deals_response_is_json_serializable(tmp_path, monkeypatch):
+    # Regression test: pred comes out of the model as numpy.float32. Plain Python
+    # access (dict lookups, print, even round()) doesn't complain about that, but
+    # FastAPI's jsonable_encoder can't serialize a raw numpy scalar and 500s - this
+    # only ever showed up on a real HTTP round trip, never in a direct Python call,
+    # which is exactly why it went unnoticed through everything except the real thing.
+    listings = _sample_listings() + [{
+        "city": "Casablanca", "neighborhood": "TestZoneA", "rent_price": 1500,
+        "surface_m2": 80, "bedrooms": 2, "bathrooms": 1, "amenities": "parking,ascenseur",
+        "property_type": "appartement", "source_site": "agenz", "source_url": "https://x/cheap2",
+    }]
+    snapshot_path = tmp_path / "snapshot.json"
+    snapshot_path.write_text(json.dumps(listings), encoding="utf-8")
+    monkeypatch.setattr(api_main, "SNAPSHOT_PATH", snapshot_path)
+
+    result = api_main.deals(threshold_pct=15.0, min_actual_price=500)
+    assert result["count"] > 0
+    json.dumps(result)  # raises TypeError if any value is a non-serializable numpy scalar
+    for deal in result["deals"]:
+        assert type(deal["discount_pct"]) is float
+        assert type(deal["predicted_rent_mad"]) is float
 
 
 def test_deals_excludes_listings_below_min_actual_price(tmp_path, monkeypatch):

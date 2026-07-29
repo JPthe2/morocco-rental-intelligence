@@ -198,7 +198,8 @@ def deals(threshold_pct: float = 15.0, limit: int = 50, min_actual_price: float 
     threshold = threshold_pct / 100.0
     flagged = []
     for listing, pred in zip(priced, predicted):
-        if pred <= 0:
+        pred = float(pred)  # numpy.float32 from the model isn't JSON-serializable by FastAPI;
+        if pred <= 0:       # casting here keeps discount/discount_pct/low_bound_80pct native floats too
             continue
         actual = listing["rent_price"]
         discount = (pred - actual) / pred
