@@ -34,12 +34,30 @@ Each can be overridden with `STREAMLIT_DATA_JSON`, `STREAMLIT_SNAPSHOT_JSON`,
 
 ## Deploy on Streamlit Community Cloud
 
-1. Push this repo to GitHub.
-2. On [share.streamlit.io](https://share.streamlit.io) → **New app** → pick the repo/branch.
+1. Push this repo to GitHub (all commits already pushed to `master`).
+2. On [share.streamlit.io](https://share.streamlit.io) → **Create app** → pick this repo/branch.
 3. Set **Main file path** to `streamlit_app/app.py`. The app's requirements live in
    `streamlit_app/requirements.txt` (same folder as the main file, so the cloud
-   picks it up automatically).
-4. Deploy. The repo is cloned in full, so the relative data/model paths work as-is.
+   picks it up automatically — see the Streamlit docs on app dependencies).
+4. Open **Advanced settings** and set **Python version = 3.12** (or 3.13).
+   This matters: the pinned model stack (`scikit-learn==1.9.0`, `xgboost>=3.3`,
+   `shap>=0.52`) requires Python ≥ 3.11/3.12. An older default Python makes the
+   build fail with the generic *"Oh no. Error running app."* page.
+5. **`.streamlit/config.toml` lives at the repo root** — that's the only location
+   Community Cloud reads it from for an entrypoint in a subdirectory (theme only,
+   not required).
+6. Deploy. The repo is cloned in full, so the relative data/model paths work as-is.
+
+### If it still says "Oh no. Error running app."
+
+That generic page hides the real cause. Find it in:
+**Workspace → your app → the app's page → "Logs"** (or Deployments tab). Paste the
+first error line here and we'll fix it. The three usual suspects:
+- **Build failure (dependency install)** → fix Python version as above.
+- **`ModuleNotFoundError` at import time** → the app's `sys.path` setup handles the
+  subfolder; verify the main file path is exactly `streamlit_app/app.py`.
+- **Runtime OOM on the free tier (1 GB)** → the app now caches model/deals/tiers
+  across reruns to cut memory and recompute; first load may still take ~1 min.
 
 ### Optional: enable the LLM-backed chat
 

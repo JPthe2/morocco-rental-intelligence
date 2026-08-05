@@ -2,7 +2,7 @@
 # was trained with these exact versions. Keep them compatible so the pickle
 # unpickles cleanly on Streamlit Community Cloud. ---
 scikit-learn==1.9.0
-xgboost>=2.0,<4
+xgboost>=3.3,<4
 joblib>=1.5,<2
 pandas>=2.2,<4
 numpy>=1.26,<3

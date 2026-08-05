@@ -52,6 +52,32 @@ def fmt_mad(n) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Cached accessors — keep the free tier's 1 GB instance from re-scoring the
+# whole dataset on every widget interaction. The underlying functions also
+# use lru_cache, but st.cache_* persists across reruns within a session.
+# ---------------------------------------------------------------------------
+
+@st.cache_resource(show_spinner="Loading model…")
+def cached_model() -> dict:
+    return load_model()
+
+
+@st.cache_data(show_spinner=False)
+def cached_deals(threshold_pct: float, limit: int) -> dict:
+    return market_engine.find_deals(threshold_pct=threshold_pct, limit=limit)
+
+
+@st.cache_data(show_spinner=False)
+def cached_tiers() -> dict:
+    return market_engine.neighborhood_tiers()
+
+
+@st.cache_data(show_spinner=False)
+def cached_predict(**kwargs) -> dict:
+    return market_engine.predict_rent(**kwargs)
+
+
+# ---------------------------------------------------------------------------
 # Sidebar
 # ---------------------------------------------------------------------------
 
@@ -66,7 +92,7 @@ with st.sidebar.expander("Backing files", expanded=False):
 
 model_ok = False
 try:
-    load_model()
+    cached_model()
     model_ok = True
 except Exception as exc:
     st.sidebar.error(f"Model not loadable: {exc}")
@@ -180,7 +206,7 @@ with tab_overview:
         st.subheader("Neighborhood tiers (unsupervised clustering)")
         if model_ok:
             try:
-                tiers = market_engine.neighborhood_tiers()
+                tiers = cached_tiers()
                 if tiers.get("error"):
                     st.info(tiers["error"])
                 else:
@@ -310,7 +336,7 @@ with tab_predict:
                 st.error("Please enter a city.")
             else:
                 with st.spinner("Running model…"):
-                    result = market_engine.predict_rent(
+                    result = cached_predict(
                         city=city,
                         neighborhood=neighborhood or None,
                         surface_m2=surface or None,
@@ -352,7 +378,7 @@ with tab_deals:
         limit = d2.slider("Max deals shown", 10, 100, 50, 10)
 
         with st.spinner("Scoring listings…"):
-            deals = market_engine.find_deals(threshold_pct=threshold, limit=limit)
+            deals = cached_deals(threshold_pct=threshold, limit=limit)
 
         st.metric("Deals found", f"{deals['count']}")
         if deals["deals"]:
