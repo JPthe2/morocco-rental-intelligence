@@ -1,0 +1,15 @@
+# --- Model stack: the saved pipeline (ml/price_prediction/models/latest.pkl)
+# was trained with these exact versions. Keep them compatible so the pickle
+# unpickles cleanly on Streamlit Community Cloud. ---
+scikit-learn==1.9.0
+xgboost>=2.0,<4
+joblib>=1.5,<2
+pandas>=2.2,<4
+numpy>=1.26,<3
+shap>=0.46
+
+# --- Networking for the optional LLM-backed chat assistant ---
+requests>=2.31
+
+# --- App runtime ---
+streamlit>=1.40
