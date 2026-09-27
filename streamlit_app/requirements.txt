@@ -13,3 +13,11 @@ requests>=2.31
 
 # --- App runtime ---
 streamlit>=1.40
+
+# Streamlit vendors a subclass of Starlette's GZipResponder and instantiates it
+# without `thread_minimum_size`. Starlette 1.4.0 made that keyword-only argument
+# required (no default), which crashes every browser request at the ASGI layer
+# with `TypeError: GZipResponder.__init__() missing 1 required keyword-only
+# argument: 'thread_minimum_size'`. 1.4.1 restored the default; keep it out of
+# the 1.4.0 release specifically.
+starlette>=1.4.1,<2

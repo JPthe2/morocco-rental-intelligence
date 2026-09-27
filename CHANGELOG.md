@@ -359,3 +359,31 @@ single-agent version), and sub-agents can't share context with each other
 mid-delegation (each `ask_scout`/`ask_analyst` call is independent; Concierge
 concatenates their answers, but Scout and Analyst can't inform each other's
 reasoning within one delegation).
+
+## Post-Phase-4 fix — Streamlit app dead in the browser (Starlette gzip mismatch)
+
+- **Symptom**: the Streamlit app started fine and the script itself ran
+  cleanly (headless `AppTest` reported zero exceptions, every tab rendered),
+  but any real browser session got nothing usable out of the server. The app
+  looked broken while every offline test passed.
+- **Root cause**: `streamlit==1.61.0` vendors a subclass of Starlette's
+  `GZipResponder` and instantiates it without the `thread_minimum_size`
+  keyword argument. `starlette==1.4.0` had made that argument required
+  (keyword-only, no default), so every HTTP response that negotiated gzip —
+  i.e. every browser request, since browsers send `Accept-Encoding: gzip` —
+  raised `TypeError: GZipResponder.__init__() missing 1 required keyword-only
+  argument: 'thread_minimum_size'` inside the ASGI middleware, returning a 500
+  and leaving the page as an empty shell. `curl` requests without the header
+  still returned 200, which is why it looked healthy from the terminal.
+- **Why the test suite missed it**: `AppTest` imports and runs `app.py`
+  in-process, bypassing the ASGI/HTTP layer entirely, so the middleware bug
+  never executed. Verified via a real headless Chrome session over the
+  DevTools protocol instead (DOM text confirmed the dashboard hydrates).
+- **Fix**: pin `starlette>=1.4.1,<2` in `streamlit_app/requirements.txt`
+  (1.4.1 restored the default value for `thread_minimum_size`; 1.6.0 was
+  installed and verified). No application code changed.
+- **Verified after fix**: HTTP requests with `Accept-Encoding: gzip` return
+  200 for `/`, `/healthz`, `/_stcore/health` and static assets; a headless
+  Chrome session renders the sidebar, all five tabs, KPI tiles
+  (1,799 listings, 7,500 MAD median), charts, and the neighborhood-tier
+  panel. Zero ASGI exceptions in the server log.
